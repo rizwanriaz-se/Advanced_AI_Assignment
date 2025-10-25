@@ -1,0 +1,937 @@
+------------Ignore Start----------------------
+import csv
+
+import nltk
+
+from CTE import DATA_BASE_DIRECTORY, FEATURES_TRAIN_DIRECTORY, FEATURES_TEST_DIRECTORY, DATA_BASE
+from get_data import read_data
+from similarityutils import *
+from gensim.models import Word2Vec, KeyedVectors
+from displayutils import *
+import re
+from dateutil.parser import parse
+from datetime import datetime
+import pytz
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+import pandas as pd
+
+
+def readData(directory):s
+    source = pd.read_csv(f'{DATA_BASE_DIRECTORY}/tableA.csv')
+    print("Source file records:", len(source))
+    target = pd.read_csv(f'{DATA_BASE_DIRECTORY}/tableB.csv')
+    print("Target file records:", len(target))
+
+    gold_standard_train = pd.read_csv(f'{DATA_BASE_DIRECTORY}/gold_standard_train.csv')
+    print("Correspondences in the gold_standard_train:", len(gold_standard_train))
+
+    gold_standard_test = pd.read_csv(f'{DATA_BASE_DIRECTORY}/gold_standard_test.csv')
+    print("Correspondences in the gold_standard_test:", len(gold_standard_test))
+
+
+    return source, target, gold_standard_train, gold_standard_test
+
+
+def getTypesofData(data):
+    dict_types = dict()
+    # return dictionary
+    for column in data:
+        column_values = data[column].dropna()
+        type_list = list(set(column_values.map(type).tolist()))
+
+        if len(type_list) == 0:
+            "No type could be detected. Default (string) will be assigned."
+            dict_types[column] = 'str'
+        elif len(type_list) > 1:
+            "More than one types could be detected. Default (string) will be assigned."
+            dict_types[column] = 'str'
+        else:
+            if str in type_list:
+                types_of_column = []
+                length = 0
+                for value in column_values:
+                    length = length + len(value.split())
+                    if re.match(r'.?\d{2,4}[-\.\\]\d{2}[-\.\\]\d{2,4}.?', value):
+                        types_of_column.append('date')
+                avg_length = length / len(column_values)
+
+                if (avg_length > 6): types_of_column.append('long_str')
+
+                if len(set(types_of_column)) == 1:
+                    if ('date' in types_of_column):
+                        dict_types[column] = 'date'
+                    elif ('long_str' in types_of_column):
+                        dict_types[column] = 'long_str'
+                    else:
+                        dict_types[column] = 'str'
+                else:
+                    "More than one types could be detected. Default (string) will be assigned."
+                    dict_types[column] = 'str'
+            else:  # else it must be numeric
+                dict_types[column] = 'numeric'
+    return dict_types
+
+
+def is_date(string, fuzzy=True):
+    try:
+        parse(string, fuzzy=fuzzy, default=datetime(1, 1, 1, tzinfo=pytz.UTC))
+        return True
+
+    except ValueError:
+        return False
+
+
+def createFeatureVectorFile(source, target, pool, featureFile, keyfeature='id', embeddings=False):
+    source_headers = source.columns.values
+    target_headers = target.columns.values
+
+    print("Get types of data")
+    dict_types_source = getTypesofData(source)
+    print(dict_types_source)
+    dict_types_target = getTypesofData(target)
+    print(dict_types_target)
+
+    common_elements = list(set(source_headers) & set(target_headers) - {keyfeature})
+    common_elements_types = dict()
+    for common_element in common_elements:
+        if (dict_types_source[common_element] is dict_types_target[common_element]):
+            common_elements_types[common_element] = dict_types_source[common_element]
+        else:
+            if (dict_types_source[common_element] == 'long_str' or dict_types_target[common_element] == 'long_str'):
+                print(
+                    "Different data types in source and target for element %s. Will assign long string" % common_element)
+                common_elements_types[common_element] = 'long_str'
+            else:
+                print("Different data types in source and target for element %s. Will assign string" % common_element)
+                common_elements_types[common_element] = 'str'
+
+    # calculate tfidf vectors
+    print("Calculate tfidf scores")
+    records = dict()
+    records["data"] = np.concatenate((source[common_elements].values, target[common_elements].values), axis=0)
+    records["ids"] = np.concatenate((source[keyfeature], target[keyfeature]), axis=0)
+
+    tfidfvector_ids = calculateTFIDF(records)
+
+    print("Create similarity based features from", len(common_elements), "common elements")
+
+    similarity_metrics = {
+        'str': ['lev', 'jaccard', 'relaxed_jaccard', 'overlap', 'cosine', 'containment'],
+        'numeric': ['abs_diff', 'num_equal'],
+        'date': ['day_diff', 'month_diff', 'year_diff'],
+        'long_str': ['cosine', 'lev', 'jaccard', 'relaxed_jaccard', 'overlap', 'cosine_tfidf', 'containment']
+    }
+
+    if not embeddings:
+        similarity_metrics['str'].remove('cosine')
+        similarity_metrics['long_str'].remove('cosine')
+
+    features = []
+
+    # fix headers
+    header_row = []
+    header_row.append('source_id')
+    header_row.append('target_id')
+    header_row.append('pair_id')
+    header_row.append('label')
+    header_row.append('cosine_tfidf')
+    for f in common_elements:
+        for sim_metric in similarity_metrics[common_elements_types[f]]:
+            header_row.append(f + "_" + sim_metric)
+
+    features.append(header_row)
+    word2vec = None
+    if embeddings:
+        print("Load pre-trained word2vec embeddings")
+        filename = 'GoogleNews-vectors-negative300.bin'
+        word2vec = KeyedVectors.load_word2vec_format(filename, binary=True)
+        print("Pre-trained embeddings loaded")
+
+    tfidfvector_perlongfeature = dict()
+    if 'long_str' in common_elements_types.values():
+        for feature in common_elements_types:
+            if common_elements_types[feature] == 'long_str':
+                records_feature = dict()
+                records_feature["data"] = np.concatenate((source[feature].values, target[feature].values), axis=0)
+                records_feature["ids"] = np.concatenate((source[keyfeature], target[keyfeature]), axis=0)
+                tfidfvector_feature = calculateTFIDF(records_feature)
+                tfidfvector_perlongfeature[feature] = tfidfvector_feature
+
+    print_progress(0, len(pool), prefix='Create Features:', suffix='Complete')
+    ps = PorterStemmer()
+    for i in range(len(pool)):
+        print_progress(i + 1, len(pool), prefix='Create Features:', suffix='Complete')
+        features_row = []
+        # metadata
+        r_source_id = pool['source_id'].loc[i]
+        r_target_id = pool['target_id'].loc[i]
+
+        features_row.append(r_source_id)
+        features_row.append(r_target_id)
+        features_row.append(str(r_source_id) + "-" + str(r_target_id))
+        features_row.append(pool['matching'].loc[i])
+
+        features_row.append(get_cosine_tfidf(tfidfvector_ids, r_source_id, r_target_id))
+
+        for f in common_elements:
+            fvalue_source = str(source.loc[source[keyfeature] == r_source_id][f].values[0])
+            fvalue_target = str(target.loc[target[keyfeature] == r_target_id][f].values[0])
+
+            if common_elements_types[f] == 'str' or common_elements_types[f] == 'long_str':
+                fvalue_source = re.sub('[^A-Za-z0-9]+', ' ', str(fvalue_source.lower())).strip()
+                fvalue_target = re.sub('[^A-Za-z0-9]+', ' ', str(fvalue_target.lower())).strip()
+            ## if long str remove stopwords and stem
+            if common_elements_types[f] == 'long_str':
+                cachedStopWords = stopwords.words("english")
+                fvalue_source = ' '.join([word for word in fvalue_source.split() if word not in cachedStopWords])
+                fvalue_target = ' '.join([word for word in fvalue_target.split() if word not in cachedStopWords])
+                # stem
+                fvalue_source = ' '.join([ps.stem(word) for word in fvalue_source.split()])
+                fvalue_target = ' '.join([ps.stem(word) for word in fvalue_target.split()])
+
+            if f in tfidfvector_perlongfeature:
+                typeSpecificSimilarities(common_elements_types[f], fvalue_source, fvalue_target, similarity_metrics,
+                                         features_row, word2vec, tfidfvector_perlongfeature[f], r_source_id,
+                                         r_target_id)
+            else:
+                typeSpecificSimilarities(common_elements_types[f], fvalue_source, fvalue_target, similarity_metrics,
+                                         features_row, word2vec)
+
+        features.append(features_row)
+
+    print('Created', len(features[0]), 'features for', len(features), 'entity pairs')
+
+    with open(featureFile, mode='w') as feature_file:
+        writer = csv.writer(feature_file)
+        writer.writerows(features)
+
+    print("Feature file created")
+
+
+def typeSpecificSimilarities(data_type, valuea, valueb, type_sim_map, features_row, word2vec, tfidfvector=None,
+                             r_source_id=None, r_target_id=None):
+    # similarity-based features
+    values_sim = []
+    for sim_metric in type_sim_map[data_type]:
+        if valuea == 'nan' or valueb == 'nan' or valuea == '' or valueb == '':
+            features_row.append(-1.0)
+            values_sim.append(-1)
+        elif sim_metric == 'lev':
+            features_row.append(get_levenshtein_sim(valuea, valueb))
+            values_sim.append(get_levenshtein_sim(valuea, valueb))
+        elif sim_metric == 'jaccard':
+            features_row.append(get_jaccard_sim(valuea, valueb))
+            values_sim.append(get_jaccard_sim(valuea, valueb))
+        elif sim_metric == 'relaxed_jaccard':
+            features_row.append(get_relaxed_jaccard_sim(valuea, valueb))
+            values_sim.append(get_relaxed_jaccard_sim(valuea, valueb))
+        elif sim_metric == 'overlap':
+            features_row.append(get_overlap_sim(valuea, valueb))
+            values_sim.append(get_overlap_sim(valuea, valueb))
+        elif sim_metric == 'containment':
+            features_row.append(get_containment_sim(valuea, valueb))
+            values_sim.append(get_containment_sim(valuea, valueb))
+        elif sim_metric == 'cosine':
+            features_row.append(get_cosine_word2vec(valuea, valueb, word2vec))
+            values_sim.append(get_cosine_word2vec(valuea, valueb, word2vec))
+        elif sim_metric == 'cosine_tfidf':
+            features_row.append(get_cosine_tfidf(tfidfvector, r_source_id, r_target_id))
+            values_sim.append(get_cosine_tfidf(tfidfvector, r_source_id, r_target_id))
+        elif sim_metric == 'abs_diff':
+            features_row.append(get_abs_diff(valuea, valueb))
+            values_sim.append(get_abs_diff(valuea, valueb))
+        elif sim_metric == 'num_equal':
+            features_row.append(get_num_equal(valuea, valueb))
+            values_sim.append(get_num_equal(valuea, valueb))
+        elif sim_metric == 'day_diff':
+            features_row.append(get_day_diff(valuea, valueb))
+            values_sim.append(get_day_diff(valuea, valueb))
+        elif sim_metric == 'month_diff':
+            features_row.append(get_month_diff(valuea, valueb))
+            values_sim.append(get_month_diff(valuea, valueb))
+        elif sim_metric == 'year_diff':
+            features_row.append(get_year_diff(valuea, valueb))
+            values_sim.append(get_year_diff(valuea, valueb))
+        else:
+            print("Unknown similarity metric %s" % sim_metric)
+        if (-1 in values_sim and len(set(values_sim)) > 1):
+            import pdb
+            pdb.set_trace()
+
+
+if __name__ == '__main__':
+    # nltk.download('stopwords')
+    DATA_BASE_DIRECTORY = "/content/ER-HAL/createFV/datasets/S_iTunes_Amazon"
+    source, target, gold_standard_train, gold_standard_test = readData(DATA_BASE_DIRECTORY)
+
+    createFeatureVectorFile(source, target, gold_standard_train, FEATURES_TRAIN_DIRECTORY)
+    createFeatureVectorFile(source, target, gold_standard_test, FEATURES_TEST_DIRECTORY)
+
+------------Ignore END----------------------
+
+main.py:
+
+from copy import deepcopy
+
+from Result import Result
+from save import save_results
+from cte import NI, DPQ, STQ
+from data_reading import get_data
+from ActiveLearning import start_active_learning
+from tools import add_result, get_average_graph
+
+
+def get_init_dicts(strategy):
+    accuracy_dict, precision_dict, recall_dict, f1_dict = {}, {}, {}, {}
+    accuracy_dict[strategy] = []
+    precision_dict[strategy] = []
+    recall_dict[strategy] = []
+    f1_dict[strategy] = []
+    return accuracy_dict, precision_dict, recall_dict, f1_dict
+
+
+def my_function(strategy, x_pool, y_pool, x_test, y_test):
+    learner, scores = start_active_learning(strategy, x_pool, y_pool, x_test, y_test)
+    return Result(strategy, learner, scores)
+
+
+def get_query_strategy():
+    choice = int(input("choose a strategy (1) for DPQ, (2) for STQ  :    \t"))
+    if choice == 1:
+        return DPQ
+    elif choice == 2:
+        return STQ
+    raise ValueError(f'Error:the query strategy [{choice}] is not supported ')
+
+
+def main():
+    x_train, y_train, x_test, y_test = get_data()
+    strategy = get_query_strategy()
+    accuracy_dict, precision_dict, recall_dict, f1_dict = get_init_dicts(strategy)
+    for i in range(NI):
+        print("ni=", i)
+        x_pool = x_train
+        y_pool = y_train
+        results = []
+
+        results.append(my_function(strategy, deepcopy(x_pool), deepcopy(y_pool), deepcopy(x_test), deepcopy(y_test)))
+
+        # save_results(results)
+        accuracy_dict, precision_dict, recall_dict, f1_dict = add_result(accuracy_dict, precision_dict,
+                                   
+                                                                         recall_dict, f1_dict, results)
+    
+    print("F1: ", f1_dict, "Accuracy: ", accuracy_dict, "Precision: ", precision_dict, "Recall: ", recall_dict)
+    
+    get_average_graph(f1_dict, "F1")
+    get_average_graph(accuracy_dict, "Accuracy")
+    get_average_graph(precision_dict, "Precision")
+    get_average_graph(recall_dict, "Recall")
+
+    print("Entering into save_results method")
+    save_results(accuracy_dict, precision_dict, recall_dict, f1_dict, strategy)
+    print("Exited save_results method")
+
+if __name__ == "__main__":
+    main()
+
+ActiveLearning.py:
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+
+from Score import Score
+from cte import N_QUERIES
+from estimator import get_active_learner
+from strategy import get_omega_value
+from tools import get_mesures
+
+
+def start_active_learning(strategy, x_pool, y_pool, x_test, y_test):
+    learner = get_active_learner(strategy)
+    # learner = get_active_learnerCTE(ESTIMATOR)
+    score = Score(0, 0, 0, 0)
+    scores = [score]
+    X = []
+    y = np.array([])
+    for i in range(N_QUERIES):
+      if len(x_pool) == 0:
+          print(f"⚠️ Pool is empty after {i} queries. Stopping active learning.")
+          break
+
+      omega = get_omega_value(strategy, i)
+      learner, x_pool, y_pool, Xi, yi = get_query(learner, x_pool, y_pool, omega)
+
+      # Update training data
+      X = np.vstack([X, Xi]) if len(X) > 0 else Xi
+      y = np.append(y, yi)
+
+      score = get_mesures(learner, x_test, y_test)
+      print(f'strategy == {strategy}   ||   i=={i}  || {score}')
+      scores.append(score)
+
+    # ✅ Always return learner and scores even if we broke early
+    return learner, scores
+
+
+
+def get_query(learner, x_pool, y_pool, omega):
+    query_idx, query_inst = learner.query(x_pool, omega_argument=omega)
+
+    # Ensure query_inst is always 2D
+    query_inst = np.squeeze(query_inst)
+    if query_inst.ndim == 1:
+        query_inst = query_inst.reshape(1, -1)
+
+    y = np.array(y_pool[query_idx], dtype=int).reshape(-1)
+
+    learner.teach(X=query_inst, y=y)
+
+    x_pool = np.delete(x_pool, query_idx, axis=0)
+    y_pool = np.delete(y_pool, query_idx, axis=0)
+    return learner, x_pool, y_pool, query_inst, y
+
+
+tools.py:
+import numpy as np
+from sklearn.metrics import precision_score, f1_score, recall_score, accuracy_score
+
+from Score import Score
+
+
+def get_diff_class(data):
+    if np.unique(data).size == 2:
+        return False
+    return True
+
+
+def get_mesures(learner, x_test, y_test):
+    y_predicted = learner.predict(x_test)
+
+    accuracy = accuracy_score(y_test, y_predicted)
+    precision = precision_score(y_test, y_predicted, zero_division=0)
+    recall = recall_score(y_test, y_predicted, zero_division=0)
+    f1 = f1_score(y_test, y_predicted, zero_division=0)
+    score = Score(accuracy, precision, recall, f1)
+    return score
+
+
+def add_result(accuracy_dict, precision_dict, recall_dict, f1_dict, results):
+    for result in results:
+        accuracy_scores, precision_scores, recall_scores, f1_scores = [], [], [], []
+        for score in result.scores_data:
+            accuracy_scores.append(score.accuracy)
+            precision_scores.append(score.precision)
+            recall_scores.append(score.recall)
+            f1_scores.append(score.f1)
+        accuracy_dict[result.strategy].append(accuracy_scores)
+        precision_dict[result.strategy].append(precision_scores)
+        recall_dict[result.strategy].append(recall_scores)
+        f1_dict[result.strategy].append(f1_scores)
+    return accuracy_dict, precision_dict, recall_dict, f1_dict
+
+
+def get_average_graph(dict, title):
+    for k, v in dict.items():
+        # Calculate the column-wise average and round to 3 decimal places
+        column_avg = np.mean(np.array(v), axis=0)
+        dict[k] = list(np.round(column_avg, 3))
+
+
+save.py:
+import csv
+from datetime import datetime
+
+from cte import DATA_BASE
+
+
+def save_results(accuracy_dict, precision_dict, recall_dict, f1_dict,strategy, add_header=True):
+    header = ['QUERY', 'Accuracy', 'Precision', 'Recall', 'F1']
+    with open(f'results/{DATA_BASE}/{strategy}_result.csv', 'w', encoding='UTF8') as f:
+        writer = csv.writer(f)
+        if add_header:
+            writer.writerow(header)
+        # write the data
+        writer.writerow(["----", "----", "----", "----", "----"])
+        for k, v in accuracy_dict.items():
+            lenn = len(v) - 1
+            writer.writerow(
+                [k, accuracy_dict[k][lenn], precision_dict[k][lenn], recall_dict[k][lenn], f1_dict[k][lenn]])
+def save_all_iterationts_results(data, title):
+    import os
+
+    # checking if the directory demo_folder
+    # exist or not.
+    if not os.path.exists(f'results/{DATA_BASE}/'):
+        # if the demo_folder directory is not present
+        # then create it.
+        os.makedirs(f'results/{DATA_BASE}/')
+    with open(f'results/{DATA_BASE}/all_iterationts_results_{title}_{datetime.now().strftime("%H_%M_%S")}.csv', 'w',encoding='UTF8') as f:
+        write = csv.writer(f)
+        write.writerows(data)
+
+
+data_reading.py:
+import numpy as np
+import pandas as pd
+
+from cte import DATA_BASE
+
+encoding_list = ['utf_8', 'ascii', 'big5', 'big5hkscs', 'cp037', 'cp273', 'cp424', 'cp437', 'cp500', 'cp720', 'cp737'
+    , 'cp775', 'cp850', 'cp852', 'cp855', 'cp856', 'cp857', 'cp858', 'cp860', 'cp861', 'cp862'
+    , 'cp863', 'cp864', 'cp865', 'cp866', 'cp869', 'cp874', 'cp875', 'cp932', 'cp949', 'cp950'
+    , 'cp1006', 'cp1026', 'cp1125', 'cp1140', 'cp1250', 'cp1251', 'cp1252', 'cp1253', 'cp1254'
+    , 'cp1255', 'cp1256', 'cp1257', 'cp1258', 'euc_jp', 'euc_jis_2004', 'euc_jisx0213', 'euc_kr'
+    , 'gb2312', 'gbk', 'gb18030', 'hz', 'iso2022_jp', 'iso2022_jp_1', 'iso2022_jp_2'
+    , 'iso2022_jp_2004', 'iso2022_jp_3', 'iso2022_jp_ext', 'iso2022_kr', 'latin_1', 'iso8859_2'
+    , 'iso8859_3', 'iso8859_4', 'iso8859_5', 'iso8859_6', 'iso8859_7', 'iso8859_8', 'iso8859_9'
+    , 'iso8859_10', 'iso8859_11', 'iso8859_13', 'iso8859_14', 'iso8859_15', 'iso8859_16', 'johab'
+    , 'koi8_r', 'koi8_t', 'koi8_u', 'kz1048', 'mac_cyrillic', 'mac_greek', 'mac_iceland', 'mac_latin2'
+    , 'mac_roman', 'mac_turkish', 'ptcp154', 'shift_jis', 'shift_jis_2004', 'shift_jisx0213', 'utf_32'
+    , 'utf_32_be', 'utf_32_le', 'utf_16', 'utf_16_be', 'utf_16_le', 'utf_7', 'utf_8_sig']
+
+
+def read_data(path):
+    for encoding in encoding_list:
+        worked = True
+        try:
+            df = pd.read_csv(path, encoding=encoding)
+        except:
+            worked = False
+        if worked:
+            print(encoding, ':\n', df.head())
+            return df;
+
+
+def get_data():
+    print(f'\n \n ________DATABASE={DATA_BASE}________\n \n')
+    dataset_train = pd.read_csv(f'datasets/{DATA_BASE}/features_train.csv')
+    dataset_test = pd.read_csv(f'datasets/{DATA_BASE}/features_test.csv')
+
+
+    print("dataset_train shape:", dataset_train.shape)
+    print("dataset_test shape:", dataset_test.shape)
+    X_train = dataset_train.iloc[:, 4:].values
+    y_train = dataset_train.iloc[:, 3].values.astype(np.int8)
+
+    X_test = dataset_test.iloc[:, 4:].values
+    y_test = dataset_test.iloc[:, 3].values.astype(np.int8)
+
+    print("X_train shape:", X_train.shape)
+    print("X_test shape:", X_test.shape)
+
+    return X_train, y_train, X_test, y_test
+
+
+cte.py:
+from sklearn.ensemble import RandomForestClassifier
+
+N_INSTANCES = 1
+NI = 1
+STQ = 'STQ'
+DPQ = 'DPQ'
+
+
+DATA_BASE ="S_iTunes_Amazon"          ;  N_QUERIES= 321           #train: 321     /   test: 109
+# DATA_BASE ="S_Walmart-Amazon"         ;  N_QUERIES= 6144          #train: 6144    /   test: 2049 0.739
+# DATA_BASE ="S_BeerAdvo_RateBeer"      ;  N_QUERIES= 268           #train: 268     /   test: 91
+# DATA_BASE ="S_Amazon_Google"          ;  N_QUERIES= 6874          #train: 6874    /   test: 2293
+# DATA_BASE ="S_Fodors_Zagats"          ;  N_QUERIES= 567           #train: 567     /   test: 189
+#
+# DATA_BASE ="D_wdc_headphones"         ;  N_QUERIES= 1163          #train: 1163    /   test: 290
+# DATA_BASE ="D_wdc_phones"             ;  N_QUERIES= 1762          #train: 1762    /   test: 440
+# DATA_BASE ="D_iTunes_Amazon"          ;  N_QUERIES= 321           #train: 321     /   test: 109
+# DATA_BASE ="D_Walmart_Amazon"         ;  N_QUERIES= 6144          #train: 6144    /   test: 2049
+#
+# DATA_BASE ="T_abt_buy"                ;  N_QUERIES= 5743          #train: 5743    /   test: 1916
+# DATA_BASE ="T_Amazon_Google"          ;  N_QUERIES= 6753            #train: 6753    /   test: 1687
+
+
+CreateFV/CTE.py:
+DATA_BASE ="S_iTunes_Amazon"
+# DATA_BASE ="S_Walmart-Amazon"
+# DATA_BASE ="S_BeerAdvo_RateBeer"
+# DATA_BASE ="S_Amazon_Google"
+# DATA_BASE ="S_Fodors_Zagats"
+
+# DATA_BASE ="D_wdc_headphones"
+# DATA_BASE ="D_wdc_phones"
+# DATA_BASE ="D_iTunes_Amazon"
+# DATA_BASE ="D_Walmart_Amazon"
+
+# DATA_BASE ="T_abt_buy"
+# DATA_BASE ="T_Amazon_Google"
+
+DATA_BASE_DIRECTORY = f'datasets/{DATA_BASE}'
+FEATURES_TRAIN_DIRECTORY = f'datasets/{DATA_BASE}/features_train'
+FEATURES_TEST_DIRECTORY = f'datasets/{DATA_BASE}/features_test'
+
+
+CreateFV/CreateFeatureVectorFile.py
+import csv
+
+import nltk
+
+from CTE import DATA_BASE_DIRECTORY, FEATURES_TRAIN_DIRECTORY, FEATURES_TEST_DIRECTORY, DATA_BASE
+from get_data import read_data
+from similarityutils import *
+from gensim.models import Word2Vec, KeyedVectors
+from displayutils import *
+import re
+from dateutil.parser import parse
+from datetime import datetime
+import pytz
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+import pandas as pd
+
+
+def readData(directory):
+    source = pd.read_csv(f'{DATA_BASE_DIRECTORY}/tableA.csv')
+    print("Source file records:", len(source))
+    target = pd.read_csv(f'{DATA_BASE_DIRECTORY}/tableB.csv')
+    print("Target file records:", len(target))
+
+    gold_standard_train = pd.read_csv(f'{DATA_BASE_DIRECTORY}/gold_standard_train.csv')
+    print("Correspondences in the gold_standard_train:", len(gold_standard_train))
+
+    gold_standard_test = pd.read_csv(f'{DATA_BASE_DIRECTORY}/gold_standard_test.csv')
+    print("Correspondences in the gold_standard_test:", len(gold_standard_test))
+
+
+    return source, target, gold_standard_train, gold_standard_test
+
+
+def getTypesofData(data):
+    dict_types = dict()
+    # return dictionary
+    for column in data:
+        column_values = data[column].dropna()
+        type_list = list(set(column_values.map(type).tolist()))
+
+        if len(type_list) == 0:
+            "No type could be detected. Default (string) will be assigned."
+            dict_types[column] = 'str'
+        elif len(type_list) > 1:
+            "More than one types could be detected. Default (string) will be assigned."
+            dict_types[column] = 'str'
+        else:
+            if str in type_list:
+                types_of_column = []
+                length = 0
+                for value in column_values:
+                    length = length + len(value.split())
+                    if re.match(r'.?\d{2,4}[-\.\\]\d{2}[-\.\\]\d{2,4}.?', value):
+                        types_of_column.append('date')
+                avg_length = length / len(column_values)
+
+                if (avg_length > 6): types_of_column.append('long_str')
+
+                if len(set(types_of_column)) == 1:
+                    if ('date' in types_of_column):
+                        dict_types[column] = 'date'
+                    elif ('long_str' in types_of_column):
+                        dict_types[column] = 'long_str'
+                    else:
+                        dict_types[column] = 'str'
+                else:
+                    "More than one types could be detected. Default (string) will be assigned."
+                    dict_types[column] = 'str'
+            else:  # else it must be numeric
+                dict_types[column] = 'numeric'
+    return dict_types
+
+
+def is_date(string, fuzzy=True):
+    try:
+        parse(string, fuzzy=fuzzy, default=datetime(1, 1, 1, tzinfo=pytz.UTC))
+        return True
+
+    except ValueError:
+        return False
+
+
+def createFeatureVectorFile(source, target, pool, featureFile, keyfeature='id', embeddings=False):
+    source_headers = source.columns.values
+    target_headers = target.columns.values
+
+    print("Get types of data")
+    dict_types_source = getTypesofData(source)
+    print(dict_types_source)
+    dict_types_target = getTypesofData(target)
+    print(dict_types_target)
+
+    common_elements = list(set(source_headers) & set(target_headers) - {keyfeature})
+    common_elements_types = dict()
+    for common_element in common_elements:
+        if (dict_types_source[common_element] is dict_types_target[common_element]):
+            common_elements_types[common_element] = dict_types_source[common_element]
+        else:
+            if (dict_types_source[common_element] == 'long_str' or dict_types_target[common_element] == 'long_str'):
+                print(
+                    "Different data types in source and target for element %s. Will assign long string" % common_element)
+                common_elements_types[common_element] = 'long_str'
+            else:
+                print("Different data types in source and target for element %s. Will assign string" % common_element)
+                common_elements_types[common_element] = 'str'
+
+    # calculate tfidf vectors
+    print("Calculate tfidf scores")
+    records = dict()
+    records["data"] = np.concatenate((source[common_elements].values, target[common_elements].values), axis=0)
+    records["ids"] = np.concatenate((source[keyfeature], target[keyfeature]), axis=0)
+
+    tfidfvector_ids = calculateTFIDF(records)
+
+    print("Create similarity based features from", len(common_elements), "common elements")
+
+    similarity_metrics = {
+        'str': ['lev', 'jaccard', 'relaxed_jaccard', 'overlap', 'cosine', 'containment'],
+        'numeric': ['abs_diff', 'num_equal'],
+        'date': ['day_diff', 'month_diff', 'year_diff'],
+        'long_str': ['cosine', 'lev', 'jaccard', 'relaxed_jaccard', 'overlap', 'cosine_tfidf', 'containment']
+    }
+
+    if not embeddings:
+        similarity_metrics['str'].remove('cosine')
+        similarity_metrics['long_str'].remove('cosine')
+
+    features = []
+
+    # fix headers
+    header_row = []
+    header_row.append('source_id')
+    header_row.append('target_id')
+    header_row.append('pair_id')
+    header_row.append('label')
+    header_row.append('cosine_tfidf')
+    for f in common_elements:
+        for sim_metric in similarity_metrics[common_elements_types[f]]:
+            header_row.append(f + "_" + sim_metric)
+
+    features.append(header_row)
+    word2vec = None
+    if embeddings:
+        print("Load pre-trained word2vec embeddings")
+        filename = 'GoogleNews-vectors-negative300.bin'
+        word2vec = KeyedVectors.load_word2vec_format(filename, binary=True)
+        print("Pre-trained embeddings loaded")
+
+    tfidfvector_perlongfeature = dict()
+    if 'long_str' in common_elements_types.values():
+        for feature in common_elements_types:
+            if common_elements_types[feature] == 'long_str':
+                records_feature = dict()
+                records_feature["data"] = np.concatenate((source[feature].values, target[feature].values), axis=0)
+                records_feature["ids"] = np.concatenate((source[keyfeature], target[keyfeature]), axis=0)
+                tfidfvector_feature = calculateTFIDF(records_feature)
+                tfidfvector_perlongfeature[feature] = tfidfvector_feature
+
+    print_progress(0, len(pool), prefix='Create Features:', suffix='Complete')
+    ps = PorterStemmer()
+    for i in range(len(pool)):
+        print_progress(i + 1, len(pool), prefix='Create Features:', suffix='Complete')
+        features_row = []
+        # metadata
+        r_source_id = pool['source_id'].loc[i]
+        r_target_id = pool['target_id'].loc[i]
+
+        features_row.append(r_source_id)
+        features_row.append(r_target_id)
+        features_row.append(str(r_source_id) + "-" + str(r_target_id))
+        features_row.append(pool['matching'].loc[i])
+
+        features_row.append(get_cosine_tfidf(tfidfvector_ids, r_source_id, r_target_id))
+
+        for f in common_elements:
+            fvalue_source = str(source.loc[source[keyfeature] == r_source_id][f].values[0])
+            fvalue_target = str(target.loc[target[keyfeature] == r_target_id][f].values[0])
+
+            if common_elements_types[f] == 'str' or common_elements_types[f] == 'long_str':
+                fvalue_source = re.sub('[^A-Za-z0-9]+', ' ', str(fvalue_source.lower())).strip()
+                fvalue_target = re.sub('[^A-Za-z0-9]+', ' ', str(fvalue_target.lower())).strip()
+            ## if long str remove stopwords and stem
+            if common_elements_types[f] == 'long_str':
+                cachedStopWords = stopwords.words("english")
+                fvalue_source = ' '.join([word for word in fvalue_source.split() if word not in cachedStopWords])
+                fvalue_target = ' '.join([word for word in fvalue_target.split() if word not in cachedStopWords])
+                # stem
+                fvalue_source = ' '.join([ps.stem(word) for word in fvalue_source.split()])
+                fvalue_target = ' '.join([ps.stem(word) for word in fvalue_target.split()])
+
+            if f in tfidfvector_perlongfeature:
+                typeSpecificSimilarities(common_elements_types[f], fvalue_source, fvalue_target, similarity_metrics,
+                                         features_row, word2vec, tfidfvector_perlongfeature[f], r_source_id,
+                                         r_target_id)
+            else:
+                typeSpecificSimilarities(common_elements_types[f], fvalue_source, fvalue_target, similarity_metrics,
+                                         features_row, word2vec)
+
+        features.append(features_row)
+
+    print('Created', len(features[0]), 'features for', len(features), 'entity pairs')
+
+    with open(featureFile, mode='w') as feature_file:
+        writer = csv.writer(feature_file)
+        writer.writerows(features)
+
+    print("Feature file created")
+
+
+def typeSpecificSimilarities(data_type, valuea, valueb, type_sim_map, features_row, word2vec, tfidfvector=None,
+                             r_source_id=None, r_target_id=None):
+    # similarity-based features
+    values_sim = []
+    for sim_metric in type_sim_map[data_type]:
+        if valuea == 'nan' or valueb == 'nan' or valuea == '' or valueb == '':
+            features_row.append(-1.0)
+            values_sim.append(-1)
+        elif sim_metric == 'lev':
+            features_row.append(get_levenshtein_sim(valuea, valueb))
+            values_sim.append(get_levenshtein_sim(valuea, valueb))
+        elif sim_metric == 'jaccard':
+            features_row.append(get_jaccard_sim(valuea, valueb))
+            values_sim.append(get_jaccard_sim(valuea, valueb))
+        elif sim_metric == 'relaxed_jaccard':
+            features_row.append(get_relaxed_jaccard_sim(valuea, valueb))
+            values_sim.append(get_relaxed_jaccard_sim(valuea, valueb))
+        elif sim_metric == 'overlap':
+            features_row.append(get_overlap_sim(valuea, valueb))
+            values_sim.append(get_overlap_sim(valuea, valueb))
+        elif sim_metric == 'containment':
+            features_row.append(get_containment_sim(valuea, valueb))
+            values_sim.append(get_containment_sim(valuea, valueb))
+        elif sim_metric == 'cosine':
+            features_row.append(get_cosine_word2vec(valuea, valueb, word2vec))
+            values_sim.append(get_cosine_word2vec(valuea, valueb, word2vec))
+        elif sim_metric == 'cosine_tfidf':
+            features_row.append(get_cosine_tfidf(tfidfvector, r_source_id, r_target_id))
+            values_sim.append(get_cosine_tfidf(tfidfvector, r_source_id, r_target_id))
+        elif sim_metric == 'abs_diff':
+            features_row.append(get_abs_diff(valuea, valueb))
+            values_sim.append(get_abs_diff(valuea, valueb))
+        elif sim_metric == 'num_equal':
+            features_row.append(get_num_equal(valuea, valueb))
+            values_sim.append(get_num_equal(valuea, valueb))
+        elif sim_metric == 'day_diff':
+            features_row.append(get_day_diff(valuea, valueb))
+            values_sim.append(get_day_diff(valuea, valueb))
+        elif sim_metric == 'month_diff':
+            features_row.append(get_month_diff(valuea, valueb))
+            values_sim.append(get_month_diff(valuea, valueb))
+        elif sim_metric == 'year_diff':
+            features_row.append(get_year_diff(valuea, valueb))
+            values_sim.append(get_year_diff(valuea, valueb))
+        else:
+            print("Unknown similarity metric %s" % sim_metric)
+        if (-1 in values_sim and len(set(values_sim)) > 1):
+            import pdb
+            pdb.set_trace()
+
+
+if __name__ == '__main__':
+    # nltk.download('stopwords')
+    DATA_BASE_DIRECTORY = "/content/ER-HAL/createFV/datasets/S_iTunes_Amazon"
+    source, target, gold_standard_train, gold_standard_test = readData(DATA_BASE_DIRECTORY)
+
+    createFeatureVectorFile(source, target, gold_standard_train, FEATURES_TRAIN_DIRECTORY)
+    createFeatureVectorFile(source, target, gold_standard_test, FEATURES_TEST_DIRECTORY)
+
+
+main.py (With graph saved as csv):
+
+from copy import deepcopy
+import pandas as pd
+import os
+
+from Result import Result
+from save import save_results
+from cte import NI, DPQ, STQ
+from data_reading import get_data
+from ActiveLearning import start_active_learning
+from tools import add_result
+
+
+def get_init_dicts(strategy):
+    accuracy_dict, precision_dict, recall_dict, f1_dict = {}, {}, {}, {}
+    accuracy_dict[strategy] = []
+    precision_dict[strategy] = []
+    recall_dict[strategy] = []
+    f1_dict[strategy] = []
+    return accuracy_dict, precision_dict, recall_dict, f1_dict
+
+
+def my_function(strategy, x_pool, y_pool, x_test, y_test):
+    learner, scores = start_active_learning(strategy, x_pool, y_pool, x_test, y_test)
+    return Result(strategy, learner, scores)
+
+
+def get_query_strategy():
+    choice = int(input("choose a strategy (1) for DPQ, (2) for STQ  :    \t"))
+    if choice == 1:
+        return DPQ
+    elif choice == 2:
+        return STQ
+    raise ValueError(f'Error:the query strategy [{choice}] is not supported ')
+
+
+def main():
+    x_train, y_train, x_test, y_test = get_data()
+    strategy = get_query_strategy()
+    accuracy_dict, precision_dict, recall_dict, f1_dict = get_init_dicts(strategy)
+
+    all_metrics = []  # store all results for CSV
+
+    for i in range(NI):
+        print("ni =", i)
+        x_pool = x_train
+        y_pool = y_train
+
+        # Run one iteration of your evaluation
+        result = my_function(strategy, deepcopy(x_pool), deepcopy(y_pool),
+                             deepcopy(x_test), deepcopy(y_test))
+
+        # result should return (acc_list, prec_list, rec_list, f1_list)
+        # for example: result = (acc, prec, rec, f1)
+
+        # Add results to your metric dicts
+        accuracy_dict, precision_dict, recall_dict, f1_dict = add_result(
+            accuracy_dict, precision_dict, recall_dict, f1_dict, [result]
+        )
+
+        # Store the latest metrics for CSV
+        acc_values = accuracy_dict[strategy][0]
+        prec_values = precision_dict[strategy][0]
+        rec_values = recall_dict[strategy][0]
+        f1_values = f1_dict[strategy][0]
+
+        for j in range(len(f1_values)):
+            all_metrics.append({
+                "iteration": i,
+                "step": j,
+                "accuracy": acc_values[j],
+                "precision": prec_values[j],
+                "recall": rec_values[j],
+                "f1_score": f1_values[j]
+            })
+
+    # Convert to DataFrame and save as CSV
+    df = pd.DataFrame(all_metrics)
+    os.makedirs("result_graph", exist_ok=True)
+    csv_path = f"result_graph/results_{strategy}.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\n✅ Metrics saved to {csv_path}")
+
+    # Optional: print sample of saved data
+    print(df.head())
+
+    # Also save the full dicts (for backward compatibility)
+    save_results(accuracy_dict, precision_dict, recall_dict, f1_dict, strategy)
+    # print("Exited save_results method.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
